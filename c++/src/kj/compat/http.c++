@@ -1045,8 +1045,52 @@ public:
       : inner(inner), headerBuffer(kj::heapArray<char>(MIN_BUFFER)), headers(table) {
   }
 
+  explicit HttpInputStreamImpl(AsyncInputStream& inner, HttpServer::SuspendedRequest sr)
+      : inner(inner),
+        headerBuffer(sr.buffer.releaseAsChars()),
+        // Initialize `messageHeaderEnd` to a safe value, we'll adjust it below.
+        messageHeaderEnd(sr.leftover.asChars().begin() - headerBuffer.begin()),
+        leftover(sr.leftover.asChars()),
+        headers(kj::mv(sr.headers)),
+        resumingRequest(HttpHeaders::Request { .method = sr.method, .url = sr.url }) {
+    // Constructor used for resuming a SuspendedRequest.
+
+    // We expect headerBuffer to look like this:
+    //   <method> <url> <headers> [CR] LF <leftover>
+    // We initialized `messageHeaderEnd` to the beginning of `leftover`, but we want to point it at
+    // the CR (or LF if there's no CR).
+    KJ_REQUIRE(messageHeaderEnd >= 2 && leftover.end() <= headerBuffer.end(),
+        "invalid SuspendedRequest - leftover buffer not where it should be");
+    KJ_REQUIRE(leftover.begin()[-1] == '\n', "invalid SuspendedRequest - missing LF");
+    messageHeaderEnd -= 1 + (leftover.begin()[-2] == '\r');
+
+    // We're in the middle of a message, so set up our state as such. Note that the only way to
+    // resume a SuspendedRequest is via an HttpServer, but HttpServers never call
+    // `awaitNextMessage()` before fully reading request bodies, meaning we expect that
+    // `messageReadQueue` will never be used.
+    ++pendingMessageCount;
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    onMessageDone = kj::mv(paf.fulfiller);
+    messageReadQueue = kj::mv(paf.promise);
+  }
+
   bool canReuse() {
     return !broken && pendingMessageCount == 0;
+  }
+
+  bool canSuspend() {
+    // We are at a suspendable point if we've parsed the headers, but haven't consumed anything
+    // beyond that.
+    //
+    // TODO(cleanup): This is a silly check; we need a more defined way to track the state of the
+    //   stream.
+    bool messageHeaderEndLooksRight =
+        (leftover.begin() - (headerBuffer.begin() + messageHeaderEnd) == 2 &&
+            leftover.begin()[-1] == '\n' && leftover.begin()[-2] == '\r')
+        || (leftover.begin() - (headerBuffer.begin() + messageHeaderEnd) == 1 &&
+            leftover.begin()[-1] == '\n');
+
+    return !broken && headerBuffer.size() > 0 && messageHeaderEndLooksRight;
   }
 
   // ---------------------------------------------------------------------------
@@ -1119,6 +1163,11 @@ public:
     //
     // Used on the client to detect when idle connections are closed from the server end. (In this
     // case, the promise always returns false or is canceled.)
+
+    if (resumingRequest != nullptr) {
+      // We're resuming a request, so report that we have a message.
+      return true;
+    }
 
     if (onMessageDone != nullptr) {
       // We're still working on reading the previous body.
@@ -1195,6 +1244,11 @@ public:
   }
 
   inline kj::Promise<HttpHeaders::RequestOrProtocolError> readRequestHeaders() {
+    KJ_IF_MAYBE(resuming, resumingRequest) {
+      KJ_DEFER(resumingRequest = nullptr);
+      return HttpHeaders::RequestOrProtocolError(*resuming);
+    }
+
     return readMessageHeaders().then([this](kj::ArrayPtr<char> text) {
       headers.clear();
       return headers.tryParseRequest(text);
@@ -1274,6 +1328,9 @@ private:
 
   HttpHeaders headers;
   // Parsed headers, after a call to parseAwaited*().
+
+  kj::Maybe<HttpHeaders::Request> resumingRequest;
+  // Non-null if we're resuming a SuspendedRequest.
 
   bool lineBreakBeforeNextHeader = false;
   // If true, the next await should expect to start with a spurious '\n' or '\r\n'. This happens
@@ -1655,6 +1712,8 @@ static_assert(!fastCaseCmp<'f','O','o','B','1','a'>("FooB1"), "");
 kj::Own<kj::AsyncInputStream> HttpInputStreamImpl::getEntityBody(
     RequestOrResponse type, HttpMethod method, uint statusCode,
     const kj::HttpHeaders& headers) {
+  KJ_REQUIRE(headerBuffer.size() > 0, "Cannot get entity body after header buffer release.");
+
   // Rules to determine how HTTP entity-body is delimited:
   //   https://tools.ietf.org/html/rfc7230#section-3.3.3
 
@@ -4667,11 +4726,13 @@ class HttpServer::Connection final: private HttpService::Response,
                                     private HttpServerErrorHandler {
 public:
   Connection(HttpServer& server, kj::AsyncIoStream& stream,
-             HttpService& service)
+             SuspendableHttpServiceFactory factory, kj::Maybe<SuspendedRequest> suspendedRequest)
       : server(server),
         stream(stream),
-        service(service),
-        httpInput(stream, server.requestHeaderTable),
+        factory(kj::mv(factory)),
+        httpInput(suspendedRequest == nullptr
+            ? HttpInputStreamImpl(stream, server.requestHeaderTable)
+            : HttpInputStreamImpl(stream, KJ_ASSERT_NONNULL(kj::mv(suspendedRequest)))),
         httpOutput(stream) {
     ++server.connectionCount;
   }
@@ -4700,10 +4761,27 @@ public:
     });
   }
 
+  SuspendedRequest suspend(SuspendableRequest& suspendable) {
+    KJ_REQUIRE(httpInput.canSuspend(),
+        "suspend() may only be called before the request body is consumed");
+    KJ_DEFER(suspended = true);
+    auto released = httpInput.releaseBuffer();
+    return {
+      .buffer = kj::mv(released.buffer),
+      .leftover = released.leftover,
+      .method = suspendable.method,
+      .url = suspendable.url,
+      .headers = suspendable.headers.cloneShallow(),
+    };
+  }
+
 private:
   HttpServer& server;
   kj::AsyncIoStream& stream;
-  HttpService& service;
+
+  SuspendableHttpServiceFactory factory;
+  // Creates a new kj::Own<HttpService> for each request we handle on this connection.
+
   HttpInputStreamImpl httpInput;
   HttpOutputStream httpOutput;
   kj::Maybe<HttpMethod> currentMethod;
@@ -4712,6 +4790,7 @@ private:
   bool upgraded = false;
   bool webSocketClosed = false;
   bool closeAfterSend = false;  // True if send() should set Connection: close.
+  bool suspended = false;
   kj::Maybe<kj::Promise<bool>> webSocketError;
 
   kj::Promise<bool> loop(bool firstRequest) {
@@ -4818,6 +4897,17 @@ private:
           auto& headers = httpInput.getHeaders();
 
           currentMethod = request.method;
+
+          SuspendableRequest suspendable(*this, request.method, request.url, headers);
+          auto maybeService = factory(suspendable);
+
+          if (suspended) {
+            return httpOutput.flush().then([this]() { return false; });
+          }
+
+          auto& service = *KJ_ASSERT_NONNULL(maybeService,
+              "SuspendableHttpServiceFactory did not suspend, but returned nullptr.");
+
           auto body = httpInput.getEntityBody(
               HttpInputStreamImpl::REQUEST, request.method, 0, headers);
 
@@ -5191,18 +5281,37 @@ kj::Promise<void> HttpServer::listenHttp(kj::Own<kj::AsyncIoStream> connection) 
 }
 
 kj::Promise<bool> HttpServer::listenHttpCleanDrain(kj::AsyncIoStream& connection) {
-  kj::Own<Connection> obj;
+  kj::Own<HttpService> srv;
 
   KJ_SWITCH_ONEOF(service) {
     KJ_CASE_ONEOF(ptr, HttpService*) {
-      obj = heap<Connection>(*this, connection, *ptr);
+      // Fake Own okay because we can assume the HttpService outlives this HttpServer, and we can
+      // assume `this` HttpServer outlives the returned `listenHttpCleanDrain()` promise, which will
+      // own the fake Own.
+      srv = kj::Own<HttpService>(ptr, kj::NullDisposer::instance);
     }
     KJ_CASE_ONEOF(func, HttpServiceFactory) {
-      auto srv = func(connection);
-      obj = heap<Connection>(*this, connection, *srv);
-      obj = obj.attach(kj::mv(srv));
+      srv = func(connection);
     }
   }
+
+  KJ_ASSERT_NONNULL(srv.get());
+
+  return listenHttpCleanDrain(connection, [srv = kj::mv(srv)](SuspendableRequest&) mutable {
+    // This factory function will be owned by the Connection object, meaning the Connection object
+    // will own the HttpService. We also know that the Connection object outlives all
+    // service.request() promises (service.request() is called from a Connection member function).
+    // The Owns we return from this function are attached to the service.request() promises,
+    // meaning this factory function will outlive all Owns we return. So, it's safe to return a fake
+    // Own.
+    return kj::Own<HttpService>(srv.get(), kj::NullDisposer::instance);
+  });
+}
+
+kj::Promise<bool> HttpServer::listenHttpCleanDrain(kj::AsyncIoStream& connection,
+    SuspendableHttpServiceFactory factory,
+    kj::Maybe<SuspendedRequest> suspendedRequest) {
+  auto obj = heap<Connection>(*this, connection, kj::mv(factory), kj::mv(suspendedRequest));
 
   // Start reading requests and responding to them, but immediately cancel processing if the client
   // disconnects.
@@ -5216,6 +5325,10 @@ kj::Promise<bool> HttpServer::listenHttpCleanDrain(kj::AsyncIoStream& connection
 
 void HttpServer::taskFailed(kj::Exception&& exception) {
   KJ_LOG(ERROR, "unhandled exception in HTTP server", exception);
+}
+
+HttpServer::SuspendedRequest HttpServer::SuspendableRequest::suspend() {
+  return connection.suspend(*this);
 }
 
 kj::Promise<void> HttpServerErrorHandler::handleClientProtocolError(
