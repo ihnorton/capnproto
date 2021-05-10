@@ -4902,7 +4902,7 @@ private:
           auto maybeService = factory(suspendable);
 
           if (suspended) {
-            return httpOutput.flush().then([this]() { return false; });
+            return httpOutput.flush().then([]() { return false; });
           }
 
           auto& service = *KJ_ASSERT_NONNULL(maybeService,
