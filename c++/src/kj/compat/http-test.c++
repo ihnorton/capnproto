@@ -3273,11 +3273,11 @@ KJ_TEST("HttpServer rejects invalid SuspendedRequests") {
     auto leftover = buffer.asPtr();
 
     return HttpServer::SuspendedRequest {
-      .buffer = kj::mv(buffer),
-      .leftover = leftover.slice(startOffset, leftover.size()),
-      .method = HttpMethod::POST,
-      .url = kj::StringPtr(leftover.asChars().begin(), size_t(0)),
-      .headers = HttpHeaders(table),
+      kj::mv(buffer),
+      leftover.slice(startOffset, leftover.size()),
+      HttpMethod::POST,
+      kj::StringPtr(leftover.asChars().begin(), size_t(0)),
+      HttpHeaders(table),
     };
   };
 
