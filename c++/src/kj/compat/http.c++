@@ -1052,7 +1052,7 @@ public:
         messageHeaderEnd(sr.leftover.asChars().begin() - headerBuffer.begin()),
         leftover(sr.leftover.asChars()),
         headers(kj::mv(sr.headers)),
-        resumingRequest(HttpHeaders::Request { .method = sr.method, .url = sr.url }) {
+        resumingRequest(HttpHeaders::Request { sr.method, sr.url }) {
     // Constructor used for resuming a SuspendedRequest.
 
     // We expect headerBuffer to look like this:
@@ -4767,11 +4767,11 @@ public:
     KJ_DEFER(suspended = true);
     auto released = httpInput.releaseBuffer();
     return {
-      .buffer = kj::mv(released.buffer),
-      .leftover = released.leftover,
-      .method = suspendable.method,
-      .url = suspendable.url,
-      .headers = suspendable.headers.cloneShallow(),
+      kj::mv(released.buffer),
+      released.leftover,
+      suspendable.method,
+      suspendable.url,
+      suspendable.headers.cloneShallow(),
     };
   }
 
