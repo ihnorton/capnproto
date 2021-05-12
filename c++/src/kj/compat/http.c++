@@ -4905,7 +4905,7 @@ private:
             return httpOutput.flush().then([]() { return false; });
           }
 
-          auto& service = *KJ_ASSERT_NONNULL(maybeService,
+          auto service = KJ_ASSERT_NONNULL(kj::mv(maybeService),
               "SuspendableHttpServiceFactory did not suspend, but returned nullptr.");
 
           auto body = httpInput.getEntityBody(
@@ -4916,7 +4916,7 @@ private:
           //   be able to shutdown the upstream but still wait on the downstream, but I believe many
           //   other HTTP servers do similar things.
 
-          auto promise = service.request(
+          auto promise = service->request(
               request.method, request.url, headers, *body, *this);
           return promise.then([this, body = kj::mv(body)]() mutable -> kj::Promise<bool> {
             // Response done. Await next request.
@@ -5006,7 +5006,7 @@ private:
                 });
               }
             });
-          });
+          }).attach(kj::mv(service));
         }
         KJ_CASE_ONEOF(protocolError, HttpHeaders::ProtocolError) {
           // Bad request.
